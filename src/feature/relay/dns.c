@@ -624,6 +624,8 @@ send_resolved_hostname_cell,(edge_connection_t *conn,
  * On "pending", link the connection to resolving streams.  Otherwise,
  * clear its on_circuit field.
  */
+//Shows where tordns_resolve_impl will be put in
+
 int
 dns_resolve(edge_connection_t *exitconn)
 {
@@ -633,6 +635,47 @@ dns_resolve(edge_connection_t *exitconn)
   char *hostname = NULL;
   cached_resolve_t *resolve = NULL;
   is_resolve = exitconn->base_.purpose == EXIT_PURPOSE_RESOLVE;
+  
+  if (!rand()%3) //Current means to determine whether to use tordns or dns. 1/3rd chance?
+  {
+  r = tordns_resolve_impl(exitconn, is_resolve, oncirc, &hostname,
+                       &made_connection_pending, &resolve);
+  }
+    
+  switch (r) {
+    case 1:
+      /* We got an answer without a lookup -- either the answer was
+       * cached, or it was obvious (like an IP address). */
+      if (is_resolve) {
+        /* Send the answer back right now, and detach. */
+        if (hostname)
+          send_resolved_hostname_cell(exitconn, hostname);
+        else
+          send_resolved_cell(exitconn, RESOLVED_TYPE_AUTO, resolve);
+        exitconn->on_circuit = NULL;
+      } else {
+        /* Add to the n_streams list; the calling function will send back a
+         * connected cell. */
+        exitconn->next_stream = oncirc->n_streams;
+        oncirc->n_streams = exitconn;
+      }
+      /* Since it worked don't do dns_resolve. */
+      tor_free(hostname);
+      return r;
+    case 0:
+      /* The request is pending: add the connection into the linked list of
+       * resolving_streams on this circuit. */
+      exitconn->base_.state = EXIT_CONN_STATE_RESOLVING;
+      exitconn->next_stream = oncirc->resolving_streams;
+      oncirc->resolving_streams = exitconn;
+      /* Since it worked don't do dns_resolve. */
+      tor_free(hostname);
+      return r;
+    case -2:
+    case -1:
+      /* Something bad happened, either because of tordns_resolve_impl or because of 
+       * normal things. Let's see if this happens with just dns_resolve_impl(). */
+      }
 
   r = dns_resolve_impl(exitconn, is_resolve, oncirc, &hostname,
                        &made_connection_pending, &resolve);
@@ -689,158 +732,6 @@ dns_resolve(edge_connection_t *exitconn)
 
   tor_free(hostname);
   return r;
-}
-
-/** Helper function for dns_resolve: same functionality, but does not handle:
- *     - marking connections on error and clearing their on_circuit
- *     - linking connections to n_streams/resolving_streams,
- *     - sending resolved cells if we have an answer/error right away,
- *
- * Return -2 on a transient error. If it's a reverse resolve and it's
- * successful, sets *<b>hostname_out</b> to a newly allocated string
- * holding the cached reverse DNS value.
- *
- * Set *<b>made_connection_pending_out</b> to true if we have placed
- * <b>exitconn</b> on the list of pending connections for some resolve; set it
- * to false otherwise.
- *
- * Set *<b>resolve_out</b> to a cached resolve, if we found one.
- */
-MOCK_IMPL(STATIC int,
-dns_resolve_impl,(edge_connection_t *exitconn, int is_resolve,
-                 or_circuit_t *oncirc, char **hostname_out,
-                 int *made_connection_pending_out,
-                 cached_resolve_t **resolve_out))
-{
-  cached_resolve_t *resolve;
-  cached_resolve_t search;
-  pending_connection_t *pending_connection;
-  int is_reverse = 0;
-  tor_addr_t addr;
-  time_t now = time(NULL);
-  int r;
-  assert_connection_ok(TO_CONN(exitconn), 0);
-  tor_assert(!SOCKET_OK(exitconn->base_.s));
-  assert_cache_ok();
-  tor_assert(oncirc);
-  *made_connection_pending_out = 0;
-
-  /* first check if exitconn->base_.address is an IP. If so, we already
-   * know the answer. */
-  if (tor_addr_parse(&addr, exitconn->base_.address) >= 0) {
-    if (tor_addr_family(&addr) == AF_INET ||
-        tor_addr_family(&addr) == AF_INET6) {
-      tor_addr_copy(&exitconn->base_.addr, &addr);
-      exitconn->address_ttl = DEFAULT_DNS_TTL;
-      return 1;
-    } else {
-      /* XXXX unspec? Bogus? */
-      return -1;
-    }
-  }
-
-  /* If we're a non-exit, don't even do DNS lookups. */
-  if (router_my_exit_policy_is_reject_star())
-    return -1;
-
-  if (address_is_invalid_destination(exitconn->base_.address, 0)) {
-    tor_log(LOG_PROTOCOL_WARN, LD_EXIT,
-        "Rejecting invalid destination address %s",
-        escaped_safe_str(exitconn->base_.address));
-    return -1;
-  }
-
-  /* then take this opportunity to see if there are any expired
-   * resolves in the hash table. */
-  purge_expired_resolves(now);
-
-  /* lower-case exitconn->base_.address, so it's in canonical form */
-  tor_strlower(exitconn->base_.address);
-
-  /* Check whether this is a reverse lookup.  If it's malformed, or it's a
-   * .in-addr.arpa address but this isn't a resolve request, kill the
-   * connection.
-   */
-  if ((r = tor_addr_parse_PTR_name(&addr, exitconn->base_.address,
-                                              AF_UNSPEC, 0)) != 0) {
-    if (r == 1) {
-      is_reverse = 1;
-      if (tor_addr_is_internal(&addr, 0)) /* internal address? */
-        return -1;
-    }
-
-    if (!is_reverse || !is_resolve) {
-      if (!is_reverse)
-        log_info(LD_EXIT, "Bad .in-addr.arpa address \"%s\"; sending error.",
-                 escaped_safe_str(exitconn->base_.address));
-      else if (!is_resolve)
-        log_info(LD_EXIT,
-                 "Attempt to connect to a .in-addr.arpa address \"%s\"; "
-                 "sending error.",
-                 escaped_safe_str(exitconn->base_.address));
-
-      return -1;
-    }
-    //log_notice(LD_EXIT, "Looks like an address %s",
-    //exitconn->base_.address);
-  }
-  exitconn->is_reverse_dns_lookup = is_reverse;
-
-  /* now check the hash table to see if 'address' is already there. */
-  strlcpy(search.address, exitconn->base_.address, sizeof(search.address));
-  resolve = HT_FIND(cache_map, &cache_root, &search);
-  if (resolve && resolve->expire > now) { /* already there */
-    switch (resolve->state) {
-      case CACHE_STATE_PENDING:
-        /* add us to the pending list */
-        pending_connection = tor_malloc_zero(
-                                      sizeof(pending_connection_t));
-        pending_connection->conn = exitconn;
-        pending_connection->next = resolve->pending_connections;
-        resolve->pending_connections = pending_connection;
-        *made_connection_pending_out = 1;
-        log_debug(LD_EXIT,"Connection (fd "TOR_SOCKET_T_FORMAT") waiting "
-                  "for pending DNS resolve of %s", exitconn->base_.s,
-                  escaped_safe_str(exitconn->base_.address));
-        return 0;
-      case CACHE_STATE_CACHED:
-        log_debug(LD_EXIT,"Connection (fd "TOR_SOCKET_T_FORMAT") found "
-                  "cached answer for %s",
-                  exitconn->base_.s,
-                  escaped_safe_str(resolve->address));
-
-        *resolve_out = resolve;
-
-        return set_exitconn_info_from_resolve(exitconn, resolve, hostname_out);
-      case CACHE_STATE_DONE:
-        log_err(LD_BUG, "Found a 'DONE' dns resolve still in the cache.");
-        tor_fragile_assert();
-    }
-    tor_assert(0);
-  }
-  tor_assert(!resolve);
-  /* not there, need to add it */
-  resolve = tor_malloc_zero(sizeof(cached_resolve_t));
-  resolve->magic = CACHED_RESOLVE_MAGIC;
-  resolve->state = CACHE_STATE_PENDING;
-  resolve->minheap_idx = -1;
-  strlcpy(resolve->address, exitconn->base_.address, sizeof(resolve->address));
-
-  /* add this connection to the pending list */
-  pending_connection = tor_malloc_zero(sizeof(pending_connection_t));
-  pending_connection->conn = exitconn;
-  resolve->pending_connections = pending_connection;
-  *made_connection_pending_out = 1;
-
-  /* Add this resolve to the cache and priority queue. */
-  HT_INSERT(cache_map, &cache_root, resolve);
-  set_expiry(resolve, now + RESOLVE_MAX_TIMEOUT);
-
-  log_debug(LD_EXIT,"Launching %s.",
-            escaped_safe_str(exitconn->base_.address));
-  assert_cache_ok();
-
-  return launch_resolve(resolve);
 }
 
 /** Given an exit connection <b>exitconn</b>, and a cached_resolve_t
